@@ -1,20 +1,20 @@
 import { App, FileView, Notice, TFile } from "obsidian";
 import * as fs from "fs";
 import * as path from "path";
-import type { CanvasData, CanvasNode, ContextGeneratorSettings } from "./types";
+import type { CanvasData, CanvasEdge, CanvasNode, ContextGeneratorSettings } from "./types";
 import { parseMermaid, extractMermaidBlock, ParsedMermaidGraph } from "./mermaid-parser";
 
-interface SyncResult {
-    added:      number;
-    updated:    number;
-    edgesAdded: number;
+interface DiffResult {
+    newNodes:     CanvasNode[];
+    newEdges:     CanvasEdge[];
+    updatedCount: number;
 }
 
 function generateId(): string {
     return Math.random().toString(36).slice(2, 18);
 }
 
-// Topological BFS layout for new nodes, placed to the right of existing content
+// Topological BFS layout: place new nodes to the right of all existing content
 function autoLayout(
     newNodeIds: string[],
     allEdges:   { from: string; to: string }[],
@@ -41,8 +41,8 @@ function autoLayout(
         }
     }
 
-    const depth  = new Map<string, number>();
-    const queue  = newNodeIds.filter(id => (inCount.get(id) ?? 0) === 0);
+    const depth = new Map<string, number>();
+    const queue = newNodeIds.filter(id => (inCount.get(id) ?? 0) === 0);
     for (const id of queue) depth.set(id, 0);
 
     let head = 0;
@@ -73,21 +73,21 @@ function autoLayout(
     return positions;
 }
 
-function applyDiff(canvas: CanvasData, graph: ParsedMermaidGraph): SyncResult {
-    const result: SyncResult = { added: 0, updated: 0, edgesAdded: 0 };
+function computeDiff(canvas: CanvasData, graph: ParsedMermaidGraph): DiffResult {
+    const result: DiffResult = { newNodes: [], newEdges: [], updatedCount: 0 };
     const byId = new Map<string, CanvasNode>(canvas.nodes.map(n => [n.id, n]));
 
-    // Nodes
+    // Identify new vs existing nodes
     const newIds: string[] = [];
     for (const mn of graph.nodes) {
         const existing = byId.get(mn.id);
         if (existing) {
             if (existing.type === "text" && existing.text !== mn.label) {
                 existing.text = mn.label;
-                result.updated++;
+                result.updatedCount++;
             } else if (existing.type === "group" && existing.label !== mn.label) {
                 existing.label = mn.label;
-                result.updated++;
+                result.updatedCount++;
             }
         } else {
             newIds.push(mn.id);
@@ -99,19 +99,22 @@ function applyDiff(canvas: CanvasData, graph: ParsedMermaidGraph): SyncResult {
         for (const id of newIds) {
             const mn  = graph.nodes.find(n => n.id === id)!;
             const pos = positions.get(id) ?? { x: 0, y: 0 };
-            canvas.nodes.push({ id, type: "text", text: mn.label, x: pos.x, y: pos.y, width: 250, height: 60 });
-            result.added++;
+            result.newNodes.push({ id, type: "text", text: mn.label, x: pos.x, y: pos.y, width: 250, height: 60 });
         }
     }
 
-    // Edges
+    // Identify new edges (both endpoints must exist or be newly added)
     const existingEdgeKeys = new Set(canvas.edges.map(e => `${e.fromNode}→${e.toNode}`));
-    const allIds = new Set(canvas.nodes.map(n => n.id));
+    const allIds = new Set([...canvas.nodes.map(n => n.id), ...result.newNodes.map(n => n.id)]);
     for (const me of graph.edges) {
         const key = `${me.from}→${me.to}`;
         if (existingEdgeKeys.has(key) || !allIds.has(me.from) || !allIds.has(me.to)) continue;
-        canvas.edges.push({ id: generateId(), fromNode: me.from, fromSide: "right", toNode: me.to, toSide: "left", label: me.label });
-        result.edgesAdded++;
+        result.newEdges.push({
+            id: generateId(),
+            fromNode: me.from, fromSide: "right",
+            toNode:   me.to,   toSide:   "left",
+            label: me.label,
+        });
     }
 
     return result;
@@ -125,7 +128,7 @@ export class CanvasUpdater {
 
     async syncFromMermaid(): Promise<void> {
         const canvasFile = this.getActiveCanvasFile();
-        if (!canvasFile) { new Notice("⚠️ Aucun canvas ouvert."); return; }
+        if (!canvasFile) return;
 
         const contextPath = this.resolveContextPath();
         if (!contextPath) return;
@@ -145,28 +148,45 @@ export class CanvasUpdater {
         const raw    = await this.app.vault.read(canvasFile);
         const canvas: CanvasData = JSON.parse(raw);
 
-        const result = applyDiff(canvas, graph);
-
-        const hasChanges = result.added > 0 || result.updated > 0 || result.edgesAdded > 0;
+        const diff = computeDiff(canvas, graph);
+        const hasChanges = diff.newNodes.length > 0 || diff.newEdges.length > 0 || diff.updatedCount > 0;
 
         if (hasChanges) {
-            await this.app.vault.modify(canvasFile, JSON.stringify(canvas, null, 2));
+            // Find an open canvas leaf for this file
+            const openLeaf = this.app.workspace.getLeavesOfType("canvas")
+                .find(l => (l.view as FileView).file?.path === canvasFile.path);
+            const internalCanvas = (openLeaf?.view as any)?.canvas;
 
-            // Force-reload the canvas view — vault.modify() alone does not update
-            // the canvas view's in-memory state on all Obsidian versions.
-            for (const leaf of this.app.workspace.getLeavesOfType("canvas")) {
-                const leafFile = (leaf.view as FileView).file;
-                if (leafFile?.path === canvasFile.path) {
-                    await leaf.openFile(canvasFile);
-                    break;
+            if (internalCanvas?.importData) {
+                // Canvas is open: inject directly into the in-memory state.
+                // This avoids the race condition where vault.modify() + openFile()
+                // causes the canvas to save its old state, overwriting our write.
+                internalCanvas.importData({
+                    nodes: diff.newNodes,
+                    edges: diff.newEdges,
+                });
+                // importData typically calls requestSave internally, but ensure it's called
+                internalCanvas.requestSave?.();
+                // Also apply label updates (importData doesn't handle existing nodes)
+                if (diff.updatedCount > 0) {
+                    const updatedCanvas: CanvasData = {
+                        nodes: [...canvas.nodes, ...diff.newNodes],
+                        edges: [...canvas.edges, ...diff.newEdges],
+                    };
+                    await this.app.vault.modify(canvasFile, JSON.stringify(updatedCanvas, null, 2));
                 }
+            } else {
+                // Canvas is not open: write directly to file
+                canvas.nodes.push(...diff.newNodes);
+                canvas.edges.push(...diff.newEdges);
+                await this.app.vault.modify(canvasFile, JSON.stringify(canvas, null, 2));
             }
         }
 
         const parts = [
-            result.added      > 0 ? `${result.added} nœud${result.added > 1 ? "s" : ""} ajouté${result.added > 1 ? "s" : ""}` : "",
-            result.updated    > 0 ? `${result.updated} mis à jour` : "",
-            result.edgesAdded > 0 ? `${result.edgesAdded} lien${result.edgesAdded > 1 ? "s" : ""} ajouté${result.edgesAdded > 1 ? "s" : ""}` : "",
+            diff.newNodes.length  > 0 ? `${diff.newNodes.length} nœud${diff.newNodes.length > 1 ? "s" : ""} ajouté${diff.newNodes.length > 1 ? "s" : ""}` : "",
+            diff.updatedCount     > 0 ? `${diff.updatedCount} mis à jour` : "",
+            diff.newEdges.length  > 0 ? `${diff.newEdges.length} lien${diff.newEdges.length > 1 ? "s" : ""} ajouté${diff.newEdges.length > 1 ? "s" : ""}` : "",
         ].filter(Boolean);
 
         new Notice(parts.length > 0
