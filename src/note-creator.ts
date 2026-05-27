@@ -45,7 +45,7 @@ const KIND_DESCRIPTIONS: Record<AnyKind, string> = {
 
 // --- Templates ---
 
-function buildTemplate(kind: AnyKind, name: string): string {
+export function buildTemplate(kind: AnyKind, name: string): string {
     switch (kind) {
         // Plan kinds
         case "epic":

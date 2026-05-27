@@ -16,14 +16,14 @@ export function parseFrontmatter(content: string): NoteFrontmatter {
         if (colon === -1) continue;
         const key = line.slice(0, colon).trim();
         const val = line.slice(colon + 1).trim();
-        if (key === "file"   && val)          result.file   = val;
-        if (key === "kind"   && val)          result.kind   = val as AnyKind;
+        if (key === "file"   && val)            result.file   = val;
+        if (key === "kind"   && val)            result.kind   = val as AnyKind;
         if (key === "frozen" && val === "true") result.frozen = true;
     }
     return result;
 }
 
-// Strips frontmatter and mermaid blocks (already in the overview diagram), collapses blank lines
+// Strips frontmatter and mermaid blocks, collapses blank lines
 function normalizeContent(content: string): string {
     const body = content
         .replace(/^---\n[\s\S]*?\n---\n?/, "")
@@ -79,7 +79,7 @@ interface GroupTree {
 }
 
 function buildGroupTree(canvas: CanvasData): { topLevelGroups: GroupTree[]; topLevelNodes: CanvasNode[] } {
-    const groups   = canvas.nodes.filter(n => n.type === "group");
+    const groups    = canvas.nodes.filter(n => n.type === "group");
     const nonGroups = canvas.nodes.filter(n => n.type !== "group");
 
     const treeMap = new Map<string, GroupTree>();
@@ -101,6 +101,18 @@ function buildGroupTree(canvas: CanvasData): { topLevelGroups: GroupTree[]; topL
     return { topLevelGroups, topLevelNodes };
 }
 
+// Collect all .md file nodes recursively (flat, excluding .canvas refs)
+function collectAllMdNodes(nodes: CanvasNode[], groups: GroupTree[]): (CanvasNode & { type: "file"; file: string })[] {
+    const result: (CanvasNode & { type: "file"; file: string })[] = [];
+    for (const n of nodes) {
+        if (n.type === "file" && n.file && !n.file.endsWith(".canvas")) {
+            result.push(n as CanvasNode & { type: "file"; file: string });
+        }
+    }
+    for (const g of groups) result.push(...collectAllMdNodes(g.nodes, g.children));
+    return result;
+}
+
 // --- Mermaid ---
 
 function mermaidEscape(text: string, maxLen = 40): string {
@@ -108,23 +120,19 @@ function mermaidEscape(text: string, maxLen = 40): string {
     return clean.length > maxLen ? clean.slice(0, maxLen - 1) + "…" : clean;
 }
 
-// Mermaid node shape per kind
 function mermaidShape(label: string, kind: AnyKind | undefined, isCanvas: boolean): string {
     if (isCanvas) return `[["${label}"]]`;
     switch (kind) {
-        // CodeKind shapes
         case "interface": return `{{"${label}"}}`;
         case "type":      return `[/"${label}"/]`;
         case "enum":      return `{"${label}"}`;
         case "config":    return `[("${label}")]`;
         case "media":     return `[/"${label}"\\]`;
-        // PlanKind shapes (visually distinct from code kinds)
         case "epic":      return `(("${label}"))`;
         case "milestone": return `([" ${label} "])`;
         case "decision":  return `{" ${label} "}`;
         case "question":  return `[" ${label} ?"]`;
         case "spec":      return `[/"${label}"/]`;
-        // task, component, file: rectangle
         default:          return `["${label}"]`;
     }
 }
@@ -161,7 +169,7 @@ function renderGroupLines(tree: GroupTree, nodeKinds: Map<string, AnyKind>, inde
     const label = mermaidEscape(tree.group.label ?? "groupe", 50);
     const lines = [
         `${indent}subgraph G_${tree.group.id}["${label}"]`,
-        `${next}${tree.group.id}:::gw`,  // invisible gateway pour les edges qui ciblent le groupe
+        `${next}${tree.group.id}:::gw`,
     ];
     for (const child of tree.children) lines.push(...renderGroupLines(child, nodeKinds, next));
     for (const node of tree.nodes)     lines.push(`${next}${mermaidNodeDef(node, nodeKinds.get(node.id))}`);
@@ -234,20 +242,22 @@ export class ContextBuilder {
         new Notice("⏳ Génération du contexte...");
         try {
             const projectPath = path.resolve(this.getVaultPath(), this.settings.projectPath);
-            const outputFile  = this.settings.outputFile;
-            const outputBase  = outputFile.replace(/\.md$/i, "");
-            const mainPath    = path.join(projectPath, outputFile);
-            const subDir      = path.join(projectPath, outputBase);
+            const mainPath    = path.join(projectPath, this.settings.outputFile);
+            const krystalDir  = path.join(projectPath, ".krystal");
+            const planDir     = path.join(krystalDir, "plan");
+            const codeDir     = path.join(krystalDir, "code");
 
-            fs.mkdirSync(projectPath, { recursive: true });
-            fs.writeFileSync(path.join(projectPath, "KRYSTAL_API.md"), KRYSTAL_API_CONTENT, "utf8");
+            fs.mkdirSync(planDir, { recursive: true });
+            fs.mkdirSync(codeDir, { recursive: true });
+            fs.writeFileSync(path.join(krystalDir, "KRYSTAL_API.md"), KRYSTAL_API_CONTENT, "utf8");
 
-            const visited = new Set<string>();
-            const count   = await this.processCanvas(canvasTFile, mainPath, subDir, null, projectPath, visited);
+            const noteCount = await this.processCanvas(
+                canvasTFile, mainPath, planDir, codeDir, krystalDir, projectPath,
+            );
 
             new Notice(
-                `✅ ${canvasTFile.basename} → ${outputFile}` +
-                (count > 1 ? ` + ${count - 1} sous-contexte${count > 2 ? "s" : ""}` : ""),
+                `✅ ${canvasTFile.basename} → ${this.settings.outputFile}` +
+                (noteCount > 0 ? ` · ${noteCount} note${noteCount > 1 ? "s" : ""}` : ""),
             );
         } catch (e: unknown) {
             const msg = e instanceof Error ? e.message : String(e);
@@ -266,183 +276,96 @@ export class ContextBuilder {
 
     private async processCanvas(
         canvasTFile: TFile,
-        outputPath:  string,
-        subDir:      string,
-        mainPath:    string | null,
+        contextPath: string,
+        planDir:     string,
+        codeDir:     string,
+        krystalDir:  string,
         projectPath: string,
-        visited:     Set<string>,
     ): Promise<number> {
-        if (visited.has(canvasTFile.path)) return 0;
-        visited.add(canvasTFile.path);
-
         const raw    = await this.app.vault.read(canvasTFile);
         const canvas: CanvasData = JSON.parse(raw);
         const { topLevelGroups, topLevelNodes } = buildGroupTree(canvas);
 
-        const nodeKinds = this.collectNodeKinds(topLevelNodes, topLevelGroups);
-        const content   = await this.buildMarkdown(
-            canvasTFile.basename, topLevelNodes, topLevelGroups,
-            canvas, nodeKinds, projectPath, outputPath, subDir, mainPath,
+        // Collect kinds for all nodes (including nested groups)
+        const allMdNodes = collectAllMdNodes(topLevelNodes, topLevelGroups);
+        const nodeKinds  = this.collectNodeKinds(allMdNodes);
+
+        // Write individual spec files → .krystal/plan/ or .krystal/code/
+        const specLinks: { name: string; kind: AnyKind; file: string; category: "plan" | "code" }[] = [];
+
+        for (const node of allMdNodes) {
+            const tfile = this.app.vault.getAbstractFileByPath(node.file);
+            if (!(tfile instanceof TFile)) continue;
+
+            const fm            = this.app.metadataCache.getFileCache(tfile)?.frontmatter ?? {};
+            const effectiveKind = (fm.kind as AnyKind | undefined) ?? nodeKinds.get(node.id) ?? "component";
+            const category      = kindCategory(effectiveKind);
+            const targetDir     = category === "plan" ? planDir : codeDir;
+            const safeName      = sanitizeFilename(tfile.basename);
+            const specPath      = path.join(targetDir, `${safeName}.md`);
+
+            const content = await this.renderNoteFile(node, canvas, effectiveKind, projectPath);
+            fs.writeFileSync(specPath, content, "utf8");
+
+            specLinks.push({ name: tfile.basename, kind: effectiveKind, file: specPath, category });
+        }
+
+        // Write CONTEXT.md
+        const contextContent = this.buildContextIndex(
+            canvasTFile.basename,
+            topLevelNodes, topLevelGroups,
+            canvas.edges, nodeKinds,
+            contextPath, krystalDir, specLinks,
         );
-        fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-        fs.writeFileSync(outputPath, content, "utf8");
+        fs.mkdirSync(path.dirname(contextPath), { recursive: true });
+        fs.writeFileSync(contextPath, contextContent, "utf8");
 
-        let count = 1;
-        count += await this.writeGroupSubContexts(topLevelGroups, canvas, projectPath, outputPath, subDir, visited);
-
-        // Canvas file references au top-level → sous-contextes récursifs
-        for (const node of topLevelNodes) {
-            if (node.type !== "file" || !node.file?.endsWith(".canvas")) continue;
-            const ref = this.app.vault.getAbstractFileByPath(node.file);
-            if (!(ref instanceof TFile)) continue;
-            const safeName = sanitizeFilename(ref.basename);
-            count += await this.processCanvas(
-                ref,
-                path.join(subDir, `${safeName}.md`),
-                path.join(subDir, safeName),
-                outputPath, projectPath, visited,
-            );
-        }
-        return count;
+        return allMdNodes.length;
     }
 
-    private async writeGroupSubContexts(
-        groups:      GroupTree[],
-        canvas:      CanvasData,
-        projectPath: string,
-        parentPath:  string,
-        currentDir:  string,
-        visited:     Set<string>,
-    ): Promise<number> {
-        if (groups.length === 0) return 0;
-        fs.mkdirSync(currentDir, { recursive: true });
-
-        let count = 0;
-        for (const tree of groups) {
-            const label    = tree.group.label ?? "groupe";
-            const safeName = sanitizeFilename(label);
-            const filePath = path.join(currentDir, `${safeName}.md`);
-            const nestedDir = path.join(currentDir, safeName);
-
-            const nodeKinds = this.collectNodeKinds(tree.nodes, tree.children);
-            const content   = await this.buildMarkdown(
-                label, tree.nodes, tree.children,
-                canvas, nodeKinds, projectPath, filePath, nestedDir, parentPath,
-            );
-            fs.writeFileSync(filePath, content, "utf8");
-            count++;
-
-            // Canvas refs dans ce groupe
-            for (const node of tree.nodes) {
-                if (node.type !== "file" || !node.file?.endsWith(".canvas")) continue;
-                const ref = this.app.vault.getAbstractFileByPath(node.file);
-                if (!(ref instanceof TFile)) continue;
-                const refSafe = sanitizeFilename(ref.basename);
-                count += await this.processCanvas(
-                    ref,
-                    path.join(nestedDir, `${refSafe}.md`),
-                    path.join(nestedDir, refSafe),
-                    filePath, projectPath, visited,
-                );
-            }
-
-            count += await this.writeGroupSubContexts(
-                tree.children, canvas, projectPath, filePath, nestedDir, visited,
-            );
-        }
-        return count;
-    }
-
-    // Lit les kinds depuis le metadataCache (sync, pas d'I/O)
-    private collectNodeKinds(nodes: CanvasNode[], groups: GroupTree[]): Map<string, AnyKind> {
+    private collectNodeKinds(nodes: (CanvasNode & { type: "file"; file: string })[]): Map<string, AnyKind> {
         const map = new Map<string, AnyKind>();
-        const scan = (nodeList: CanvasNode[], groupList: GroupTree[]) => {
-            for (const node of nodeList) {
-                if (node.type !== "file" || !node.file || node.file.endsWith(".canvas")) continue;
-                const tfile = this.app.vault.getAbstractFileByPath(node.file);
-                if (!(tfile instanceof TFile)) continue;
-                const fm = this.app.metadataCache.getFileCache(tfile)?.frontmatter;
-                if (fm?.kind) map.set(node.id, fm.kind as AnyKind);
-            }
-            for (const g of groupList) scan(g.nodes, g.children);
-        };
-        scan(nodes, groups);
+        for (const node of nodes) {
+            const tfile = this.app.vault.getAbstractFileByPath(node.file);
+            if (!(tfile instanceof TFile)) continue;
+            const fm = this.app.metadataCache.getFileCache(tfile)?.frontmatter;
+            if (fm?.kind) map.set(node.id, fm.kind as AnyKind);
+        }
         return map;
     }
 
-    private async buildMarkdown(
-        title:       string,
-        nodes:       CanvasNode[],
-        subGroups:   GroupTree[],
-        canvas:      CanvasData,
-        nodeKinds:   Map<string, AnyKind>,
-        projectPath: string,
-        currentFile: string,
-        subDir:      string,
-        mainPath:    string | null,
-    ): Promise<string> {
+    private buildContextIndex(
+        title:      string,
+        nodes:      CanvasNode[],
+        groups:     GroupTree[],
+        edges:      CanvasEdge[],
+        nodeKinds:  Map<string, AnyKind>,
+        contextPath: string,
+        krystalDir:  string,
+        specLinks:   { name: string; kind: AnyKind; file: string; category: "plan" | "code" }[],
+    ): string {
         const lines: string[] = [];
         const now = new Date().toLocaleDateString("fr-FR", {
             day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit",
         });
-
-        const apiPath = path.join(projectPath, "KRYSTAL_API.md");
+        const apiPath = path.join(krystalDir, "KRYSTAL_API.md");
 
         lines.push(`# ${title}`);
-        if (mainPath) lines.push(`_[← Contexte principal](${relPath(currentFile, mainPath)})_`);
-        lines.push(`_Généré le ${now} · [→ Krystal API](${relPath(currentFile, apiPath)}) — comment interagir avec ce fichier_`);
+        lines.push(`_Généré le ${now} · [→ Krystal API](${relPath(contextPath, apiPath)}) — comment interagir avec ces fichiers_`);
         lines.push("");
 
-        // Diagramme Mermaid
-        lines.push(buildMermaidDiagram(nodes, subGroups, canvas.edges, nodeKinds));
+        // Full Mermaid diagram
+        lines.push(buildMermaidDiagram(nodes, groups, edges, nodeKinds));
         lines.push("");
 
-        // Liens vers sous-graphes
-        const canvasRefs = nodes.filter(
-            (n): n is CanvasNode & { type: "file"; file: string } =>
-                n.type === "file" && !!n.file && n.file.endsWith(".canvas"),
-        );
-        const subContextLinks = [
-            ...subGroups.map(t => ({
-                label: t.group.label ?? "groupe",
-                file:  path.join(subDir, `${sanitizeFilename(t.group.label ?? "groupe")}.md`),
-            })),
-            ...canvasRefs.map(n => {
-                const base = path.basename(n.file, ".canvas");
-                return { label: base, file: path.join(subDir, `${sanitizeFilename(base)}.md`) };
-            }),
-        ];
-        if (subContextLinks.length > 0) {
-            lines.push("## Sous-graphes");
-            lines.push("");
-            for (const sc of subContextLinks) {
-                lines.push(`- [${sc.label}](${relPath(currentFile, sc.file)})`);
-            }
-            lines.push("");
-        }
-
-        // Notes .md
-        const mdNodes = nodes.filter(
-            (n): n is CanvasNode & { type: "file"; file: string } =>
-                n.type === "file" && !!n.file && !n.file.endsWith(".canvas"),
-        );
-        if (mdNodes.length > 0) {
-            lines.push("## Composants");
-            lines.push("");
-            for (const node of mdNodes) {
-                const rendered = await this.renderMdNode(node, canvas, nodeKinds.get(node.id), projectPath);
-                lines.push(...rendered);
-            }
-        }
-
-        // Text nodes
+        // Text nodes inline
         const textNodes = nodes.filter(
             (n): n is CanvasNode & { type: "text"; text: string } => n.type === "text" && !!n.text,
         );
         if (textNodes.length > 0) {
             lines.push("## Notes");
             lines.push("");
-            for (const node of textNodes) { lines.push(node.text.trim()); lines.push(""); }
+            for (const n of textNodes) { lines.push(n.text.trim()); lines.push(""); }
         }
 
         // Link nodes
@@ -452,63 +375,81 @@ export class ContextBuilder {
         if (linkNodes.length > 0) {
             lines.push("## Liens externes");
             lines.push("");
-            for (const node of linkNodes) lines.push(`- [${node.label ?? node.url}](${node.url})`);
+            for (const n of linkNodes) lines.push(`- [${n.label ?? n.url}](${n.url})`);
             lines.push("");
         }
 
-        // Footer
-        const parts = [
-            mdNodes.length   > 0 ? `${mdNodes.length} composant${mdNodes.length > 1 ? "s" : ""}`         : "",
-            subContextLinks.length > 0 ? `${subContextLinks.length} sous-graphe${subContextLinks.length > 1 ? "s" : ""}` : "",
-            textNodes.length > 0 ? `${textNodes.length} note${textNodes.length > 1 ? "s" : ""}`           : "",
-        ].filter(Boolean);
+        // Index table — Plan
+        const planLinks = specLinks.filter(s => s.category === "plan");
+        if (planLinks.length > 0) {
+            lines.push("## Plan");
+            lines.push("");
+            lines.push("| Note | Kind | Spec |");
+            lines.push("|---|---|---|");
+            for (const s of planLinks) {
+                lines.push(`| **${s.name}** | \`${s.kind}\` | [${relPath(contextPath, s.file)}](${relPath(contextPath, s.file)}) |`);
+            }
+            lines.push("");
+        }
+
+        // Index table — Code
+        const codeLinks = specLinks.filter(s => s.category === "code");
+        if (codeLinks.length > 0) {
+            lines.push("## Code");
+            lines.push("");
+            lines.push("| Note | Kind | Spec |");
+            lines.push("|---|---|---|");
+            for (const s of codeLinks) {
+                lines.push(`| **${s.name}** | \`${s.kind}\` | [${relPath(contextPath, s.file)}](${relPath(contextPath, s.file)}) |`);
+            }
+            lines.push("");
+        }
+
         lines.push("---");
-        lines.push(`_${parts.join(" · ") || "vide"}_`);
+        lines.push(`_${specLinks.length} spec${specLinks.length !== 1 ? "s" : ""} · ${planLinks.length} plan · ${codeLinks.length} code_`);
 
         return lines.join("\n");
     }
 
-    private async renderMdNode(
+    private async renderNoteFile(
         node:        CanvasNode & { file: string },
         canvas:      CanvasData,
-        kind:        AnyKind | undefined,
+        kind:        AnyKind,
         projectPath: string,
-    ): Promise<string[]> {
-        const lines: string[] = [];
+    ): Promise<string> {
         const tfile = this.app.vault.getAbstractFileByPath(node.file);
 
         if (!(tfile instanceof TFile) || tfile.extension !== "md") {
-            lines.push(`### ${path.basename(node.file, path.extname(node.file))}`);
-            lines.push(`_Fichier introuvable : \`${node.file}\`_`);
-            lines.push("");
-            return lines;
+            const name = path.basename(node.file, path.extname(node.file));
+            return `### ${name} <!-- vault:${node.file} kind:file -->\n\n_Fichier introuvable : \`${node.file}\`_\n`;
         }
 
         const raw = await this.app.vault.read(tfile);
-        // Utilise le metadataCache pour le frontmatter structuré
         const fm  = this.app.metadataCache.getFileCache(tfile)?.frontmatter ?? {};
-        const effectiveKind: AnyKind = (fm.kind as AnyKind | undefined) ?? kind ?? "component";
 
         const connections = canvas.edges
             .filter((e: CanvasEdge) => e.fromNode === node.id || e.toNode === node.id)
             .map((e: CanvasEdge) => {
-                const otherId  = e.fromNode === node.id ? e.toNode : e.fromNode;
-                const other    = canvas.nodes.find(n => n.id === otherId);
-                const name     = other?.file
+                const otherId = e.fromNode === node.id ? e.toNode : e.fromNode;
+                const other   = canvas.nodes.find(n => n.id === otherId);
+                const name    = other?.file
                     ? path.basename(other.file, path.extname(other.file))
                     : (other?.label ?? otherId);
-                const dir   = e.fromNode === node.id ? "→" : "←";
-                const label = e.label ? ` _(${e.label})_` : "";
-                return `${dir} **${name}**${label}`;
+                const dir     = e.fromNode === node.id ? "→" : "←";
+                const lbl     = e.label ? ` _(${e.label})_` : "";
+                return `${dir} **${name}**${lbl}`;
             });
 
-        const isFrozen  = fm.frozen === true;
-        const isPlan    = kindCategory(effectiveKind) === "plan";
-        const markers   = [
+        const isFrozen = fm.frozen === true;
+        const isPlan   = kindCategory(kind) === "plan";
+        const attrParts = [
+            `kind:${kind}`,
             isFrozen ? "frozen:true" : "",
             isPlan   ? "plan:true"   : "",
         ].filter(Boolean).join(" ");
-        lines.push(`### ${tfile.basename} <!-- vault:${tfile.path}${markers ? " " + markers : ""} -->`);
+
+        const lines: string[] = [];
+        lines.push(`### ${tfile.basename} <!-- vault:${tfile.path} ${attrParts} -->`);
         if (fm.file) {
             lines.push(`**Source :** [${fm.file}](vscode://file/${path.join(projectPath, fm.file as string)})`);
         }
@@ -517,25 +458,21 @@ export class ContextBuilder {
         }
         lines.push("");
 
-        // Bloc structuré (généré depuis le frontmatter) — marqué pour que l'importer le saute
-        const kindLines = this.renderKindBlock(effectiveKind, tfile.basename, fm);
+        const kindLines = this.renderKindBlock(kind, tfile.basename, fm);
         if (kindLines.length > 0) {
             lines.push("<!-- kind-block -->");
             lines.push(...kindLines);
             lines.push("<!-- /kind-block -->");
         }
 
-        // Corps de la note (prose + blocs de code) — zone modifiable par l'IA
-        // Les notes gelées (frozen:true) sont incluses en lecture seule
         const body = normalizeContent(raw);
         if (body) { lines.push(body); lines.push(""); }
 
-        return lines;
+        return lines.join("\n");
     }
 
     private renderKindBlock(kind: AnyKind, name: string, fm: Record<string, unknown>): string[] {
         const lines: string[] = [];
-
         switch (kind) {
             case "interface": {
                 type Field = { name: string; type: string; desc?: string };
@@ -543,9 +480,7 @@ export class ContextBuilder {
                 if (fields?.length) {
                     lines.push("```typescript");
                     lines.push(`interface ${name} {`);
-                    for (const f of fields) {
-                        lines.push(`  ${f.name}: ${f.type};${f.desc ? `  // ${f.desc}` : ""}`);
-                    }
+                    for (const f of fields) lines.push(`  ${f.name}: ${f.type};${f.desc ? `  // ${f.desc}` : ""}`);
                     lines.push("}");
                     lines.push("```");
                     lines.push("");
@@ -568,9 +503,7 @@ export class ContextBuilder {
                 if (values?.length) {
                     lines.push("```typescript");
                     lines.push(`enum ${name} {`);
-                    for (const v of values) {
-                        lines.push(`  ${v.name},${v.desc ? `  // ${v.desc}` : ""}`);
-                    }
+                    for (const v of values) lines.push(`  ${v.name},${v.desc ? `  // ${v.desc}` : ""}`);
                     lines.push("}");
                     lines.push("```");
                     lines.push("");
@@ -597,7 +530,6 @@ export class ContextBuilder {
                 if (parts.length)  { lines.push(parts.join(" · ")); lines.push(""); }
                 break;
             }
-            // --- PlanKind blocks ---
             case "epic": {
                 const rows: string[] = [];
                 if (fm.status)   rows.push(`**Statut :** ${fm.status}`);
@@ -613,9 +545,7 @@ export class ContextBuilder {
                 break;
             }
             case "milestone": {
-                const rows: string[] = [];
-                if (fm.date)      rows.push(`**Date :** ${fm.date}`);
-                if (rows.length) { lines.push(rows.join(" · ")); lines.push(""); }
+                if (fm.date) { lines.push(`**Date :** ${fm.date}`); lines.push(""); }
                 break;
             }
             case "decision": {
@@ -632,7 +562,6 @@ export class ContextBuilder {
                 if (fm.status) { lines.push(`**Statut :** ${fm.status}`); lines.push(""); }
                 break;
             }
-            // spec, component, file, task (no structured block — prose only)
         }
         return lines;
     }

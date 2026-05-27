@@ -4,7 +4,6 @@ import { ContextBuilder } from "./context-builder";
 import { NoteCreator } from "./note-creator";
 import { createVSCodeMenuHandler } from "./vscode-menu";
 import { ContextImporter } from "./context-importer";
-import { CanvasUpdater } from "./canvas-updater";
 import type { ContextGeneratorSettings } from "./types";
 
 const ICON_ID = "context-generator";
@@ -41,15 +40,9 @@ export default class ContextGeneratorPlugin extends Plugin {
         });
 
         this.addCommand({
-            id: "import-context",
-            name: "Synchroniser depuis CONTEXT.md",
+            id: "sync",
+            name: "Synchroniser (notes + canvas)",
             callback: () => new ContextImporter(this.app, this.settings).importFromContext(),
-        });
-
-        this.addCommand({
-            id: "sync-canvas-from-mermaid",
-            name: "Synchroniser canvas depuis Mermaid (CONTEXT.md)",
-            callback: () => new CanvasUpdater(this.app, this.settings).syncFromMermaid(),
         });
 
         this.addSettingTab(new ContextGeneratorSettingTab(this.app, this));

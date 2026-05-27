@@ -51,7 +51,7 @@ export function parseMermaid(block: string): ParsedMermaidGraph {
     const seenNodes    = new Set<string>();
     const subgraphStack: ParsedMermaidSubgraph[] = [];
 
-    for (const raw of block.split("\n")) {
+    for (const raw of block.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n")) {
         const line = raw.trimEnd();
         if (!line.trim() || SKIP_RE.test(line)) continue;
 
@@ -100,6 +100,7 @@ export function parseMermaid(block: string): ParsedMermaidGraph {
 
 /** Extract the first ```mermaid ... ``` block from a markdown string. */
 export function extractMermaidBlock(markdown: string): string | null {
-    const m = markdown.match(/```mermaid\n([\s\S]*?)\n```/);
+    const normalized = markdown.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const m = normalized.match(/```mermaid\n([\s\S]*?)\n```/);
     return m ? m[1] : null;
 }
