@@ -110,7 +110,7 @@ function applyDiff(canvas: CanvasData, graph: ParsedMermaidGraph): SyncResult {
     for (const me of graph.edges) {
         const key = `${me.from}→${me.to}`;
         if (existingEdgeKeys.has(key) || !allIds.has(me.from) || !allIds.has(me.to)) continue;
-        canvas.edges.push({ id: generateId(), fromNode: me.from, toNode: me.to, label: me.label });
+        canvas.edges.push({ id: generateId(), fromNode: me.from, fromSide: "right", toNode: me.to, toSide: "left", label: me.label });
         result.edgesAdded++;
     }
 
@@ -147,7 +147,21 @@ export class CanvasUpdater {
 
         const result = applyDiff(canvas, graph);
 
-        await this.app.vault.modify(canvasFile, JSON.stringify(canvas, null, 2));
+        const hasChanges = result.added > 0 || result.updated > 0 || result.edgesAdded > 0;
+
+        if (hasChanges) {
+            await this.app.vault.modify(canvasFile, JSON.stringify(canvas, null, 2));
+
+            // Force-reload the canvas view — vault.modify() alone does not update
+            // the canvas view's in-memory state on all Obsidian versions.
+            for (const leaf of this.app.workspace.getLeavesOfType("canvas")) {
+                const leafFile = (leaf.view as FileView).file;
+                if (leafFile?.path === canvasFile.path) {
+                    await leaf.openFile(canvasFile);
+                    break;
+                }
+            }
+        }
 
         const parts = [
             result.added      > 0 ? `${result.added} nœud${result.added > 1 ? "s" : ""} ajouté${result.added > 1 ? "s" : ""}` : "",
@@ -157,7 +171,7 @@ export class CanvasUpdater {
 
         new Notice(parts.length > 0
             ? `✅ Canvas synchronisé — ${parts.join(", ")}`
-            : "✅ Canvas déjà à jour.");
+            : `✅ Canvas déjà à jour (${graph.nodes.length} nœuds vérifiés).`);
     }
 
     private getActiveCanvasFile(): TFile | null {
