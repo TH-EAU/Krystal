@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Build output (compilé depuis src/)
+main.js
+
+# Obsidian plugin data (settings locaux)
+data.json
+
+# Lockfiles
+bun.lock
+
+# Memory (contexte local Claude)
+memory/
+
+# Divers
+*.js.map

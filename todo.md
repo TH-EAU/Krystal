@@ -1,0 +1,3 @@
+ - un systeme de diff, qui permettra a un agent qui ne travaille que sur le code de voir ce qui a été modifié dans le contexte
+ - un systeme templates ou je peux importer des templates tout fait qui crééent les bons trucs a la fin
+ - onn pourrais lier ca a des compétences ou autre pour avoir un résultat toujours bon. Pour avoir des bonnes pratiques. 
