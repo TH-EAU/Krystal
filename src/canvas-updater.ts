@@ -165,7 +165,8 @@ export class CanvasUpdater {
                     nodes: diff.newNodes,
                     edges: diff.newEdges,
                 });
-                // importData typically calls requestSave internally, but ensure it's called
+                // Recenter viewport so newly placed nodes (off to the right) become visible.
+                internalCanvas.zoomToFit?.();
                 internalCanvas.requestSave?.();
                 // Also apply label updates (importData doesn't handle existing nodes)
                 if (diff.updatedCount > 0) {
