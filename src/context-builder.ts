@@ -3,6 +3,7 @@ import * as path from "path";
 import * as fs from "fs";
 import type { AnyKind, CanvasData, CanvasNode, CanvasEdge, ContextGeneratorSettings, NoteFrontmatter } from "./types";
 import { kindCategory } from "./types";
+import { KRYSTAL_API_CONTENT } from "./krystal-api";
 
 // --- Frontmatter (used by vscode-menu.ts) ---
 
@@ -239,6 +240,7 @@ export class ContextBuilder {
             const subDir      = path.join(projectPath, outputBase);
 
             fs.mkdirSync(projectPath, { recursive: true });
+            fs.writeFileSync(path.join(projectPath, "KRYSTAL_API.md"), KRYSTAL_API_CONTENT, "utf8");
 
             const visited = new Set<string>();
             const count   = await this.processCanvas(canvasTFile, mainPath, subDir, null, projectPath, visited);
@@ -384,9 +386,11 @@ export class ContextBuilder {
             day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit",
         });
 
+        const apiPath = path.join(projectPath, "KRYSTAL_API.md");
+
         lines.push(`# ${title}`);
         if (mainPath) lines.push(`_[← Contexte principal](${relPath(currentFile, mainPath)})_`);
-        lines.push(`_Généré le ${now}_`);
+        lines.push(`_Généré le ${now} · [→ Krystal API](${relPath(currentFile, apiPath)}) — comment interagir avec ce fichier_`);
         lines.push("");
 
         // Diagramme Mermaid
