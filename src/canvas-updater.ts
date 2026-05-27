@@ -161,11 +161,24 @@ export class CanvasUpdater {
     }
 
     private getActiveCanvasFile(): TFile | null {
+        // Prefer the currently open canvas view
         const leaf = this.app.workspace.activeLeaf;
-        if (!leaf) return null;
-        if (leaf.view.getViewType() !== "canvas") return null;
-        const file = (leaf.view as FileView).file;
-        return file instanceof TFile ? file : null;
+        if (leaf?.view.getViewType() === "canvas") {
+            const file = (leaf.view as FileView).file;
+            if (file instanceof TFile) return file;
+        }
+        // Fallback: canvas configured in settings
+        const { canvasFile } = this.settings;
+        if (!canvasFile) {
+            new Notice("⚠️ Aucun canvas ouvert ni configuré dans les settings.");
+            return null;
+        }
+        const f = this.app.vault.getAbstractFileByPath(canvasFile);
+        if (!(f instanceof TFile)) {
+            new Notice(`⚠️ Canvas introuvable : ${canvasFile}`);
+            return null;
+        }
+        return f;
     }
 
     private resolveContextPath(): string | null {
