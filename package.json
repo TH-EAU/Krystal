@@ -1,6 +1,6 @@
 {
     "name": "obsidian-context-generator",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "description": "Génère un CONTEXT.md depuis le canvas Obsidian",
     "main": "main.js",
     "scripts": {
